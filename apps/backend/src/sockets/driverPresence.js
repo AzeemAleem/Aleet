@@ -1,126 +1,73 @@
-const User = require('../models/User');
+const {
+  recordConnect,
+  recordHeartbeat,
+  touchLastSeen,
+  scheduleDisconnectOffline,
+  cancelPendingDisconnectOffline,
+} = require('../services/presenceService');
+
+/** @type {Map<string, number>} userId → active /drivers socket count */
+const activeSockets = new Map();
+
+function incrementSockets(userId) {
+  const key = String(userId);
+  const next = (activeSockets.get(key) || 0) + 1;
+  activeSockets.set(key, next);
+  return next;
+}
+
+function decrementSockets(userId) {
+  const key = String(userId);
+  const next = Math.max(0, (activeSockets.get(key) || 0) - 1);
+  if (next === 0) activeSockets.delete(key);
+  else activeSockets.set(key, next);
+  return next;
+}
 
 /**
- * Driver presence handler — connection = online, disconnect = offline.
+ * Socket handlers for /drivers.
  *
- * On connect: if the user is an approved Diamond/Pro driver, flip
- * `driver.isOnline = true` and bump `driver.lastSeenAt`, then broadcast
- * a `driver:presence` event to the /admin namespace so admin UIs update
- * in real time without polling or refreshing.
- *
- * On disconnect: flip `driver.isOnline = false` IMMEDIATELY (real-time)
- * and broadcast the same event with isOnline=false.
- *
- * On any event/pong: bump `driver.lastSeenAt`.
+ * Connect + heartbeat keep the session alive. Disconnect starts a short timer
+ * (cancelled by background HTTP heartbeat or reconnect). Browser tab close
+ * also sends an explicit offline beacon from the client.
  */
+function registerDriverPresence(_io, socket) {
+  const userId = socket.userId;
 
-/** Emit a presence change to all connected admin sockets. */
-function broadcastPresence(io, payload) {
-    if (!io) return;
-    try {
-        io.of('/admin').emit('driver:presence', payload);
-    } catch (e) {
-        console.error('[presence] broadcast failed:', e?.message || e);
+  cancelPendingDisconnectOffline(userId);
+  incrementSockets(userId);
+
+  recordConnect(userId).catch((e) => {
+    console.error('[presence] recordConnect failed:', userId, e?.message || e);
+  });
+
+  socket.on('driver:heartbeat', () => {
+    recordHeartbeat(userId).catch(() => { /* ignore */ });
+  });
+
+  socket.onAny((eventName) => {
+    if (eventName === 'driver:heartbeat') return;
+    touchLastSeen(userId).catch(() => { /* ignore */ });
+  });
+
+  if (socket.conn) {
+    socket.conn.on('heartbeat', () => {
+      touchLastSeen(userId).catch(() => { /* ignore */ });
+    });
+  }
+
+  socket.on('disconnect', (reason) => {
+    const remaining = decrementSockets(userId);
+    if (remaining === 0) {
+      scheduleDisconnectOffline(userId).catch((e) => {
+        console.error('[presence] scheduleDisconnectOffline failed:', userId, e?.message || e);
+      });
     }
-}
-
-/**
- * Mark a driver online if they qualify (approved + Diamond/Pro).
- * Returns the updated driver doc (lean) so the broadcaster has fresh
- * lastSeenAt to send to admins. Non-qualifying users are allowed to
- * connect but don't affect AQD and don't trigger a broadcast.
- */
-async function markOnline(userId) {
-    const result = await User.findOneAndUpdate(
-        {
-            _id: userId,
-            role: 'driver',
-            'driver.status': 'approved',
-            'driver.tier': { $in: ['Diamond', 'Pro'] },
-        },
-        { $set: { 'driver.isOnline': true, 'driver.lastSeenAt': new Date() } },
-        { new: true, projection: { 'driver.isOnline': 1, 'driver.lastSeenAt': 1 } }
-    ).lean();
-    return result;
-}
-
-/** Mark a driver offline immediately. */
-async function markOffline(userId) {
-    const result = await User.findOneAndUpdate(
-        { _id: userId, role: 'driver' },
-        { $set: { 'driver.isOnline': false } },
-        { new: true, projection: { 'driver.isOnline': 1, 'driver.lastSeenAt': 1 } }
-    ).lean();
-    return result;
-}
-
-/** Bump lastSeenAt without changing isOnline. Cheap freshness signal. */
-async function touchLastSeen(userId) {
-    await User.updateOne(
-        { _id: userId, role: 'driver' },
-        { $set: { 'driver.lastSeenAt': new Date() } }
+    console.log(
+      `[presence] socket disconnected for ${userId} (${reason}); ` +
+      `${remaining} socket(s) left; offline in ~2min unless heartbeat/reconnect`,
     );
+  });
 }
 
-/**
- * Attach handlers to an authenticated socket. Called from sockets/index.js
- * after the auth middleware has populated `socket.userId` and `socket.role`.
- */
-function registerDriverPresence(io, socket) {
-    const userId = socket.userId;
-
-    // Flip online on connect, then notify admins.
-    markOnline(userId)
-        .then((doc) => {
-            if (doc) {
-                broadcastPresence(io, {
-                    userId,
-                    isOnline: true,
-                    lastSeenAt: doc.driver?.lastSeenAt || new Date().toISOString(),
-                });
-            }
-        })
-        .catch((e) => {
-            console.error('[presence] markOnline failed:', userId, e?.message || e);
-        });
-
-    // Refresh lastSeenAt on any inbound application-level event the driver
-    // app emits (e.g. keep-alive pings sent by the client every 2 min).
-    socket.onAny(() => {
-        touchLastSeen(userId).catch(() => { /* ignore */ });
-    });
-
-    // Refresh lastSeenAt on Engine.IO heartbeat pongs. socket.onAny() only
-    // catches named application events — it misses the transport-level
-    // ping/pong that Socket.IO uses to detect dead connections. Without this,
-    // an idle driver (app open, no clicks) will have their lastSeenAt go stale
-    // after 5 min and the presence sweeper will incorrectly mark them offline.
-    if (socket.conn) {
-        socket.conn.on('heartbeat', () => {
-            touchLastSeen(userId).catch(() => { /* ignore */ });
-        });
-    }
-
-    socket.on('disconnect', (reason) => {
-        markOffline(userId)
-            .then((doc) => {
-                broadcastPresence(io, {
-                    userId,
-                    isOnline: false,
-                    lastSeenAt: doc?.driver?.lastSeenAt || null,
-                });
-            })
-            .catch((e) => {
-                console.error('[presence] markOffline failed:', userId, e?.message || e);
-            });
-        console.log(`[presence] socket disconnected for ${userId} (${reason}); marked offline`);
-    });
-}
-
-module.exports = {
-    registerDriverPresence,
-    markOnline,
-    markOffline,
-    touchLastSeen,
-    broadcastPresence,
-};
+module.exports = { registerDriverPresence };

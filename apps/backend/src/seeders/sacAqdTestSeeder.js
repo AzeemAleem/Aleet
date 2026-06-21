@@ -236,13 +236,11 @@ async function ensureTestDrivers(region, vehicleTypeIds, needed) {
 }
 
 async function countAqd(regionId) {
-  const freshness = new Date(Date.now() - 5 * 60 * 1000);
   return User.countDocuments({
     role: 'driver',
     'driver.status': 'approved',
     'driver.tier': { $in: ['Diamond', 'Pro'] },
     'driver.isOnline': true,
-    'driver.lastSeenAt': { $gte: freshness },
     $or: [
       { 'driver.serveAllRegions': { $ne: false } },
       { 'driver.regions': regionId },
